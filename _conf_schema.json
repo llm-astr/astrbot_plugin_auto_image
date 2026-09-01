@@ -1,0 +1,67 @@
+{
+  "api_key": {
+    "description": "Grsai API Key（在 https://grsai.dakka.com.cn 注册获取）",
+    "type": "string",
+    "default": "",
+    "hint": "必填，形如 sk-xxxxxxxx"
+  },
+  "api_node": {
+    "description": "API 节点：cn 国内节点（grsai.dakka.com.cn），global 国际节点（api.grsai.com）",
+    "type": "string",
+    "default": "cn",
+    "options": [
+      "cn",
+      "global"
+    ]
+  },
+  "model": {
+    "description": "默认生图模型（用户未指定时使用；所有模型名与常见叫法均支持模糊匹配）",
+    "type": "string",
+    "default": "nano-banana-fast",
+    "options": [
+      "nano-banana-fast",
+      "nano-banana",
+      "nano-banana-pro",
+      "nano-banana-pro-vt",
+      "nano-banana-pro-cl",
+      "nano-banana-pro-vip",
+      "nano-banana-pro-4k-vip",
+      "nano-banana-2",
+      "nano-banana-2-cl",
+      "nano-banana-2-2k-cl",
+      "nano-banana-2-4k-cl",
+      "gpt-image-2",
+      "gpt-image-2-vip"
+    ]
+  },
+  "aspect_ratio": {
+    "description": "默认画面比例（auto / 1:1 / 3:4 / 4:3 / 9:16 / 16:9 / 2:3 / 3:2 / 4:5 / 5:4 / 21:9 等）",
+    "type": "string",
+    "default": "auto"
+  },
+  "image_size": {
+    "description": "默认清晰度（仅 nano-banana pro / 2 系列生效）",
+    "type": "string",
+    "default": "1K",
+    "options": [
+      "1K",
+      "2K",
+      "4K"
+    ]
+  },
+  "show_progress_msg": {
+    "description": "提交生图任务后是否先发送一条「生成中」提示消息",
+    "type": "bool",
+    "default": true
+  },
+  "poll_timeout": {
+    "description": "等待生成结果的最长时间（秒）",
+    "type": "int",
+    "default": 300
+  },
+  "poll_interval": {
+    "description": "结果轮询间隔（秒）",
+    "type": "int",
+    "default": 4
+  }
+}
