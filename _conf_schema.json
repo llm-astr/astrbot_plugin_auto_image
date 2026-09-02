@@ -49,10 +49,19 @@
       "4K"
     ]
   },
-  "show_progress_msg": {
-    "description": "提交生图任务后是否先发送一条「生成中」提示消息",
-    "type": "bool",
-    "default": true
+  "progress_msg_mode": {
+    "description": "开始生成时的提示方式：fixed=插件固定提示语（默认，原版生成信息）；llm=插件不发提示，由 bot 以正常回话方式表达",
+    "type": "string",
+    "default": "fixed",
+    "options": [
+      "fixed",
+      "llm"
+    ]
+  },
+  "wait_before_generate": {
+    "description": "LLM 识别到生图/改图意图后、开始生成前的等待时间（秒），用于接收用户随后发送的参考图，防止遗漏；0 表示不等待，最大 60（仅对话模式生效，指令模式不等待）",
+    "type": "int",
+    "default": 0
   },
   "poll_timeout": {
     "description": "等待生成结果的最长时间（秒）",
