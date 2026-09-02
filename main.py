@@ -7,10 +7,13 @@ AstrBot 插件：LLM 自主生图 / 改图（Grsai API）
 - 开始生成提示可切换：插件固定提示语（默认）/ 由 bot 以正常回话方式表达
 - 可配置识别到生图意图后的等待时间，便于接收用户随后发送的参考图，防止遗漏
 - 可选失败自动切换：生成失败时按自定义顺序依次切换备选模型重试
+- 支持表情包引用：图片表情自动作参考图，小黄脸表情转为提示词；GIF 默认提取首帧（可切 direct 实测）
+- 支持按语义取图：「我发的 N 张」「某某发的 N 张」，按发送时间升序作为参考图
 - 保留 /生图 /改图 /生图模型 指令，用于精确控制
 """
 
 import asyncio
+import re
 import sys
 import uuid
 import time
@@ -23,6 +26,11 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star, register
+
+try:  # QQ 小黄脸表情组件（部分平台/版本可能没有）
+    from astrbot.api.message_components import Face
+except ImportError:
+    Face = None
 
 try:
     from astrbot.api.event import MessageChain
@@ -55,8 +63,11 @@ else:
 
 # 会话图片缓存：改图工具自动取最近图片
 RECENT_TTL = 600      # 缓存 10 分钟
-RECENT_MAX = 8        # 每个会话最多记 8 张
-EDIT_REF_COUNT = 4    # 改图时最多携带最近 4 张
+RECENT_MAX = 16       # 每个会话最多记 16 张（供按发送人/张数挑选）
+EDIT_REF_COUNT = 4    # 改图时默认最多携带最近 4 张
+
+# 中文数字 → 数量
+_CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
 
 NO_IMAGE_MSG = (
     "当前会话中没有找到可供修改的图片，"
@@ -65,37 +76,42 @@ NO_IMAGE_MSG = (
 
 
 class _RecentImages:
-    """按会话缓存用户最近发送的图片（时间有限、数量有限）"""
+    """按会话缓存用户最近发送的图片（时间有限、数量有限）。
+
+    每条记录为 (时间戳, 图片来源, 发送者ID, 发送者昵称)，
+    支持按发送人和张数挑选（如「我发的 3 张」「某某发的 2 张」）。
+    """
 
     def __init__(self, ttl: int, max_per_session: int):
         self.ttl = ttl
         self.max = max_per_session
-        self._data: OrderedDict[str, list[tuple[float, str]]] = OrderedDict()
+        # session -> [(ts, src, sender_id, sender_name)]
+        self._data: OrderedDict[str, list[tuple[float, str, str, str]]] = OrderedDict()
 
-    def add(self, session: str, src: str) -> None:
+    def add(self, session: str, src: str, sender_id: str = "", sender_name: str = "") -> None:
         now = time.monotonic()
         lst = self._data.setdefault(session, [])
-        lst.append((now, src))
-        self._data[session] = [(t, s) for t, s in lst if now - t <= self.ttl][-self.max:]
+        lst.append((now, src, sender_id, sender_name))
+        self._data[session] = [e for e in lst if now - e[0] <= self.ttl][-self.max:]
         self._data.move_to_end(session)
         if len(self._data) > 200:
             self._data.popitem(last=False)
 
-    def latest(self, session: str, n: int = 1) -> list[str]:
+    def entries(self, session: str) -> list[tuple[float, str, str, str]]:
+        """会话内未过期的全部记录，按发送时间升序（最早的在前）"""
         now = time.monotonic()
-        lst = [
-            (t, s)
-            for t, s in self._data.get(session, [])
-            if now - t <= self.ttl
-        ]
-        return [s for _, s in lst[-n:]]
+        lst = [e for e in self._data.get(session, []) if now - e[0] <= self.ttl]
+        return sorted(lst, key=lambda e: e[0])
+
+    def latest(self, session: str, n: int = 1) -> list[str]:
+        return [e[1] for e in self.entries(session)[-n:]]
 
 
 @register(
     "astrbot_plugin_auto_image",
     "Kimi",
-    "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数支持关键词模糊匹配，失败可自动切换备选模型（Grsai API）",
-    "1.2.0",
+    "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数关键词模糊匹配，失败自动切换备选模型，支持表情包/GIF 参考图（Grsai API）",
+    "1.3.0",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -150,12 +166,102 @@ class AutoImagePlugin(Star):
                 chain.append(m)
         return chain
 
-    def _collect_refs(self, event: AstrMessageEvent) -> list[str]:
-        """收集参考图：当前消息 / 回复引用 优先，其次会话最近图片"""
+    def _collect_refs(self, event: AstrMessageEvent, hint_text: str = "") -> list[str]:
+        """收集参考图，优先级：
+        1. 当前消息 / 回复引用中的图片
+        2. 按语义挑选：「我发的 N 张」→ 该用户最近 N 张；「某某（QQ昵称）发的 N 张」→ 昵称匹配
+           会话缓存中该用户最近 N 张；均按发送时间升序（最早发的为第一张）
+        3. 无语义提示时：会话最近图片（最多 EDIT_REF_COUNT 张，升序）
+        """
         refs = self._extract_image_sources(event)
-        if not refs:
-            refs = self._recent.latest(event.unified_msg_origin, EDIT_REF_COUNT)
-        return refs
+        if refs:
+            return refs
+
+        entries = self._recent.entries(event.unified_msg_origin)
+        if not entries:
+            return []
+
+        n, owner = self._parse_ref_hint(hint_text, event, entries)
+        pool = entries
+        if owner == "me":
+            sid = self._sender_id(event)
+            if sid:
+                pool = [e for e in pool if e[2] == sid]
+        elif owner:  # 昵称
+            pool = [e for e in pool if e[3] and (owner in e[3] or e[3] in owner)]
+            if not pool:
+                pool = entries
+
+        if n:
+            pool = pool[-n:]
+        elif owner is None:
+            pool = pool[-EDIT_REF_COUNT:]
+        return [e[1] for e in pool[:MAX_REF_IMAGES]]
+
+    @staticmethod
+    def _sender_id(event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_sender_id())
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _sender_name(event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_sender_name())
+        except Exception:
+            return ""
+
+    def _parse_ref_hint(
+        self,
+        text: str,
+        event: AstrMessageEvent,
+        entries: list[tuple[float, str, str, str]],
+    ) -> tuple[int | None, str | None]:
+        """从文本解析参考图语义：返回 (张数, 归属)。归属为 'me' 或昵称子串"""
+        n: int | None = None
+        owner: str | None = None
+        if not text:
+            return n, owner
+
+        # 张数：「3张」「三张」「两幅」等
+        m = re.search(r"([0-9]+|[一二两三四五六七八])\s*[张幅个](?:图|图片|照片|表情包?)?", text)
+        if m:
+            tok = m.group(1)
+            n = int(tok) if tok.isdigit() else _CN_DIGITS.get(tok)
+
+        # 归属：我发的 / 我的
+        if re.search(r"我\s*发?的", text):
+            owner = "me"
+        else:
+            # 昵称匹配：缓存中出现过的昵称在文本里被提到（取最长避免部分包含）
+            names = sorted({e[3] for e in entries if e[3]}, key=len, reverse=True)
+            for name in names:
+                if len(name) >= 2 and name in text:
+                    owner = name
+                    break
+        return n, owner
+
+    @staticmethod
+    def _extract_face_hint(event: AstrMessageEvent) -> str:
+        """提取 QQ 小黄脸表情，转为提示词文本（表情包图片本身会作为参考图，见 Image 提取）"""
+        if Face is None:
+            return ""
+        ids: list[str] = []
+        for comp in event.get_messages():
+            if isinstance(comp, Face):
+                fid = getattr(comp, "id", None)
+                if fid is not None:
+                    ids.append(str(fid))
+            elif isinstance(comp, Reply):
+                for sub in comp.chain or []:
+                    if isinstance(sub, Face):
+                        fid = getattr(sub, "id", None)
+                        if fid is not None:
+                            ids.append(str(fid))
+        if ids:
+            return "（用户发送了 QQ 表情 " + ", ".join(ids) + "，请结合其情绪与含义进行创作）"
+        return ""
 
     @staticmethod
     def _extract_image_sources(event: AstrMessageEvent) -> list[str]:
@@ -260,13 +366,17 @@ class AutoImagePlugin(Star):
             return NO_IMAGE_MSG
 
         # 3) 参考图并行下载并转成 base64 data URL，避免 API 拉不动平台图链
+        gif_mode = self.config.get("gif_handling", "first_frame")
         ref_data_urls: list[str] = []
         if ref_sources:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=60)
             ) as session:
                 results = await asyncio.gather(
-                    *(to_data_url(session, src) for src in ref_sources[:MAX_REF_IMAGES]),
+                    *(
+                        to_data_url(session, src, gif_mode)
+                        for src in ref_sources[:MAX_REF_IMAGES]
+                    ),
                     return_exceptions=True,
                 )
             errors = [r for r in results if isinstance(r, Exception)]
@@ -367,10 +477,12 @@ class AutoImagePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def record_recent_images(self, event: AstrMessageEvent):
-        """被动记录会话中的图片，供改图工具自动取用"""
+        """被动记录会话中的图片（含发送者信息），供改图/语义取图使用"""
         try:
+            sid = self._sender_id(event)
+            sname = self._sender_name(event)
             for src in self._extract_image_sources(event):
-                self._recent.add(event.unified_msg_origin, src)
+                self._recent.add(event.unified_msg_origin, src, sid, sname)
         except Exception:
             pass
 
@@ -387,15 +499,17 @@ class AutoImagePlugin(Star):
             params(string): 用户对生成参数的要求原文，如模型、画面比例、清晰度，例如 "用pro模型画横版4K"；用户没有特殊要求时留空，系统会自动模糊匹配并回退到默认参数。
         """
         prompt = (prompt or "").strip()
+        prompt += self._extract_face_hint(event)
         if not prompt:
             return "缺少图片描述，请根据用户需求补充 prompt 后重新调用。"
         logger.info(f"[auto-image] LLM 触发文生图: {prompt[:80]} params={params!r}")
+        hint_text = f"{event.message_str} {prompt}"
         return await self._generate_and_send(
             event,
             prompt,
             params or "",
             ref_sources=self._extract_image_sources(event),
-            ref_collector=lambda: self._collect_refs(event),
+            ref_collector=lambda: self._collect_refs(event, hint_text),
             wait=self._wait_seconds(),
         )
 
@@ -410,10 +524,12 @@ class AutoImagePlugin(Star):
             params(string): 用户对生成参数的要求原文（模型/比例/清晰度），例如 "竖版 高清"；没有特殊要求时留空。
         """
         prompt = (prompt or "").strip()
+        prompt += self._extract_face_hint(event)
         if not prompt:
             return "缺少修改要求描述，请根据用户需求补充 prompt 后重新调用。"
 
-        refs = self._collect_refs(event)
+        hint_text = f"{event.message_str} {prompt}"
+        refs = self._collect_refs(event, hint_text)
         wait = self._wait_seconds()
         if not refs and wait <= 0:
             return NO_IMAGE_MSG
@@ -424,7 +540,7 @@ class AutoImagePlugin(Star):
             prompt,
             params or "",
             ref_sources=refs,
-            ref_collector=lambda: self._collect_refs(event),
+            ref_collector=lambda: self._collect_refs(event, hint_text),
             wait=wait,
             require_ref=True,
         )
@@ -464,7 +580,8 @@ class AutoImagePlugin(Star):
         params_text = " ".join(
             filter(None, [model or "", ratio or "", size or ""])
         )
-        refs = self._extract_image_sources(event)
+        prompt += self._extract_face_hint(event)
+        refs = self._extract_image_sources(event) or self._collect_refs(event, body)
         result = await self._generate_and_send(event, prompt, params_text, refs)
         yield event.plain_result(result)
 
@@ -483,7 +600,7 @@ class AutoImagePlugin(Star):
             )
             return
 
-        refs = self._collect_refs(event)
+        refs = self._collect_refs(event, body)
         if not refs:
             yield event.plain_result(
                 "没有找到可供修改的图片，请先发送图片或回复引用一张图片。"
@@ -494,6 +611,7 @@ class AutoImagePlugin(Star):
         ratio = match_ratio(opts.get("aspect_ratio", "")) or match_ratio(prompt)
         size = match_size(opts.get("image_size", "")) or match_size(prompt)
         prompt = strip_param_words(prompt) or body
+        prompt += self._extract_face_hint(event)
 
         params_text = " ".join(
             filter(None, [model or "", ratio or "", size or ""])
