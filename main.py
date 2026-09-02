@@ -134,7 +134,7 @@ class _RecentImages:
     "astrbot_plugin_auto_image",
     "Kimi",
     "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数关键词模糊匹配，失败自动切换备选模型，支持表情包/GIF 参考图（Grsai API）",
-    "1.3.2",
+    "1.3.3",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -291,11 +291,14 @@ class AutoImagePlugin(Star):
         return ""
 
     @staticmethod
-    def _extract_raw_mface(event: AstrMessageEvent) -> list[tuple[str, str]]:
-        """从原始消息中提取适配层未转换的 QQ 收藏/商城表情（mface 消息段）。
+    def _extract_raw_segments(
+        event: AstrMessageEvent, seg_types: tuple[str, ...]
+    ) -> list[tuple[str, str]]:
+        """从原始消息（raw_message）中提取指定类型消息段的图片 URL。
 
-        AstrBot 的 aiocqhttp 适配层只转换 image 段，mface（收藏表情/商城表情）
-        会被丢弃，这里直接解析 raw_message 兜底，把表情 URL 作为参考图来源。
+        用于兜底：QQ 收藏/商城表情（mface）不会被适配层转换成 Image 组件；
+        某些插件也可能把 Image 从消息链中剥掉（如把图片转述为文字后合成新
+        事件），但原始消息段中往往仍保留图片 URL。
         """
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
         segs = None
@@ -307,12 +310,15 @@ class AutoImagePlugin(Star):
             return []
         out: list[tuple[str, str]] = []
         for seg in segs:
-            if not isinstance(seg, dict) or seg.get("type") != "mface":
+            if not isinstance(seg, dict) or seg.get("type") not in seg_types:
                 continue
             data = seg.get("data") or {}
             url = data.get("url") or ""
+            file = data.get("file") or ""
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 out.append((url, ""))
+            elif isinstance(file, str) and file.startswith(("http://", "https://")):
+                out.append((file, ""))
         return out
 
     @staticmethod
@@ -321,7 +327,8 @@ class AutoImagePlugin(Star):
 
         每条返回 (url, file) 元组，两者可能只有一个有效；转换时本地文件
         优先、失败回退 URL（本地临时文件会被 AstrBot 定期清理）。
-        QQ 收藏/商城表情（mface）不会被适配层转成 Image，从原始消息兜底。
+        QQ 收藏/商城表情（mface）不会被适配层转成 Image，从原始消息兜底；
+        消息链中的图片被其他插件剥掉时，也从原始消息的 image 段恢复。
         """
         sources: list[tuple[str, str]] = []
 
@@ -343,10 +350,16 @@ class AutoImagePlugin(Star):
 
         # mface 兜底（去重）
         seen = {u for u, _ in sources if u}
-        for url, _f in AutoImagePlugin._extract_raw_mface(event):
+        for url, _f in AutoImagePlugin._extract_raw_segments(event, ("mface",)):
             if url not in seen:
                 sources.append((url, ""))
                 seen.add(url)
+        # 消息链无图时的兜底：原始消息 image 段（应对图片被其他插件转述/剥除）
+        if not sources:
+            for url, _f in AutoImagePlugin._extract_raw_segments(event, ("image",)):
+                if url not in seen:
+                    sources.append((url, ""))
+                    seen.add(url)
         return sources[:MAX_REF_IMAGES]
 
     @staticmethod
