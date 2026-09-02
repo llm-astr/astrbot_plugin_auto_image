@@ -8,11 +8,13 @@ AstrBot 插件：LLM 自主生图 / 改图（Grsai API）
 - 可配置识别到生图意图后的等待时间，便于接收用户随后发送的参考图，防止遗漏
 - 可选失败自动切换：生成失败时按自定义顺序依次切换备选模型重试
 - 支持表情包引用：图片表情自动作参考图，小黄脸表情转为提示词；GIF 默认提取首帧（可切 direct 实测）
-- 支持按语义取图：「我发的 N 张」「某某发的 N 张」，按发送时间升序作为参考图
+- 支持按语义取图：「我发的 N 张」「某某发的 N 张」「图1/图2」序数取图，按发送时间升序作为参考图
+- 参考图与缓存索引落盘，插件热重载 / 保存配置 / 重启后缓存不丢失
 - 保留 /生图 /改图 /生图模型 指令，用于精确控制
 """
 
 import asyncio
+import json
 import re
 import shutil
 import sys
@@ -73,6 +75,7 @@ _CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六":
 NO_IMAGE_MSG = (
     "当前会话中没有找到可供修改的图片，"
     "请提示用户先发送一张图片、或回复引用一张图片后重试。"
+    "不要调用 shell / 文件读写等工具在磁盘上搜索用户图片。"
 )
 
 
@@ -100,42 +103,107 @@ async def _convert_ref(
 
 
 class _RecentImages:
-    """按会话缓存用户最近发送的图片（时间有限、数量有限）。
+    """按会话缓存用户最近发送的图片（时间有限、数量有限），索引落盘。
 
     每条记录为 (时间戳, 图片来源, 发送者ID, 发送者昵称)，其中图片来源为
     (url, file) 元组；支持按发送人和张数挑选（如「我发的 3 张」「某某发的 2 张」）。
+    索引写入 recent_index.json：AstrBot 在保存配置 / 面板重载 / 文件变更时会
+    热重载插件，内存缓存随之清空；索引落盘后配合持久化的图片副本，重载
+    （甚至重启）后缓存仍可恢复使用。
     """
 
-    def __init__(self, ttl: int, max_per_session: int):
+    def __init__(self, ttl: int, max_per_session: int, index_file=None):
         self.ttl = ttl
         self.max = max_per_session
+        self.index_file = Path(index_file) if index_file else None
         # session -> [(ts, (url, file), sender_id, sender_name)]
         self._data: OrderedDict[str, list[tuple]] = OrderedDict()
+        self._load()
 
     def add(self, session: str, src, sender_id: str = "", sender_name: str = "") -> None:
-        now = time.monotonic()
+        now = time.time()
         lst = self._data.setdefault(session, [])
         lst.append((now, src, sender_id, sender_name))
         self._data[session] = [e for e in lst if now - e[0] <= self.ttl][-self.max:]
         self._data.move_to_end(session)
         if len(self._data) > 200:
             self._data.popitem(last=False)
+        self._save()
 
     def entries(self, session: str) -> list[tuple]:
         """会话内未过期的全部记录，按发送时间升序（最早的在前）"""
-        now = time.monotonic()
+        now = time.time()
         lst = [e for e in self._data.get(session, []) if now - e[0] <= self.ttl]
         return sorted(lst, key=lambda e: e[0])
 
     def latest(self, session: str, n: int = 1) -> list:
         return [e[1] for e in self.entries(session)[-n:]]
 
+    # ---- 索引落盘 / 恢复 ----
+
+    def _load(self) -> None:
+        """从索引文件恢复缓存：丢弃过期记录与本地副本已不存在且无 URL 的记录"""
+        if not self.index_file or not self.index_file.is_file():
+            return
+        try:
+            raw = json.loads(self.index_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        for session, lst in raw.items():
+            if not isinstance(session, str) or not isinstance(lst, list):
+                continue
+            valid: list[tuple] = []
+            for e in lst:
+                try:
+                    ts, src, sid, sname = e
+                    ts = float(ts)
+                    if now - ts > self.ttl:
+                        continue
+                    url = str(src[0] or "") if isinstance(src, (list, tuple)) and src else ""
+                    file = (
+                        str(src[1] or "")
+                        if isinstance(src, (list, tuple)) and len(src) > 1
+                        else ""
+                    )
+                    if file and not Path(file).is_file():
+                        file = ""  # 本地副本已被清理，仅剩 URL 时仍可尝试
+                    if not url and not file:
+                        continue
+                    valid.append((ts, (url, file), str(sid), str(sname)))
+                except Exception:
+                    continue
+            if valid:
+                self._data[session] = valid[-self.max:]
+
+    def _save(self) -> None:
+        """把索引写回磁盘（失败不影响功能，仅失去重载恢复能力）"""
+        if not self.index_file:
+            return
+        try:
+            raw: dict = {}
+            for session, lst in self._data.items():
+                items = [
+                    [ts, [src[0] or "", src[1] or ""], sid, sname]
+                    for ts, src, sid, sname in lst
+                    if isinstance(src, tuple)
+                ]
+                if items:
+                    raw[session] = items
+            self.index_file.write_text(
+                json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
 
 @register(
     "astrbot_plugin_auto_image",
     "Kimi",
     "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数关键词模糊匹配，失败自动切换备选模型，支持表情包/GIF 参考图（Grsai API）",
-    "1.3.4",
+    "1.3.5",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -146,7 +214,9 @@ class AutoImagePlugin(Star):
         self.temp_dir.mkdir(exist_ok=True)
         self.cache_dir = self.temp_dir / "cache"
         self.cache_dir.mkdir(exist_ok=True)
-        self._recent = _RecentImages(RECENT_TTL, RECENT_MAX)
+        self._recent = _RecentImages(
+            RECENT_TTL, RECENT_MAX, self.cache_dir / "recent_index.json"
+        )
 
     # ---------------- 工具方法 ----------------
 
@@ -192,26 +262,51 @@ class AutoImagePlugin(Star):
                 chain.append(m)
         return chain
 
-    def _persist_ref(self, src) -> tuple:
+    async def _persist_ref(self, src) -> tuple:
         """持久化参考图来源：把本地临时文件复制到插件目录。
 
-        AstrBot 的 data/temp 媒体文件几分钟内就会被清理、QQ 多媒体链接
-        （带 rkey）也会过期；消息刚收到时本地文件一定还在，复制一份到插件
-        自己的 cache 目录，保证缓存期内随时可取。
+        AstrBot 的 data/temp 媒体文件一两分钟内就会被清理、QQ 多媒体链接
+        （带 rkey）也会过期；而消息刚分发时适配器可能还没把文件下载落盘，
+        因此短暂重试等待文件出现后再复制，保证缓存期内随时可取。
         """
         if not isinstance(src, tuple):
             return src
         url, file = src
-        if file:
-            p = Path(file)
+        if not file:
+            return src
+        p = Path(file)
+        for attempt in range(4):
             try:
-                if p.is_file():
+                if p.is_file() and p.stat().st_size > 0:
                     suffix = p.suffix or ".jpg"
                     dst = self.cache_dir / f"{uuid.uuid4().hex}{suffix}"
                     shutil.copyfile(p, dst)
                     return (url, str(dst))
             except OSError:
                 pass
+            if attempt < 3:
+                await asyncio.sleep(0.4)
+        return src
+
+    def _repersist_at_collect(self, src):
+        """取用参考图时再次持久化：本地文件还在且不在插件 cache 里就复制一份。
+
+        防止从取图到提交生成的间隙（等待用户补图 / LLM 思考 / 排队）里
+        AstrBot 把临时文件清掉；已在 cache 中的文件不会重复复制。
+        """
+        if not isinstance(src, tuple):
+            return src
+        url, file = src
+        if not file:
+            return src
+        p = Path(file)
+        try:
+            if p.is_file() and p.stat().st_size > 0 and self.cache_dir not in p.parents:
+                dst = self.cache_dir / f"{uuid.uuid4().hex}{p.suffix or '.jpg'}"
+                shutil.copyfile(p, dst)
+                return (url, str(dst))
+        except OSError:
+            pass
         return src
 
     def _purge_cache(self) -> None:
@@ -255,7 +350,9 @@ class AutoImagePlugin(Star):
 
         if n:
             pool = pool[-n:]
-        elif owner is None:
+        else:
+            # 未指明张数（含「我发的」这类只指归属的说法）时按默认张数截取，
+            # 避免把缓存期内的陈旧图片一并带上
             pool = pool[-EDIT_REF_COUNT:]
         return [e[1] for e in pool[:MAX_REF_IMAGES]]
 
@@ -294,6 +391,13 @@ class AutoImagePlugin(Star):
         if m:
             tok = m.group(1) or m.group(2)
             n = int(tok) if tok.isdigit() else _CN_DIGITS.get(tok)
+
+        if n is None:
+            # 「图1 / 图2 …」序数引用：张数取出现的最大序号
+            # （如「把我发的图1角色改为图2角色」→ 需要最近 2 张）
+            ords = re.findall(r"图\s*([0-9]+)(?![0-9])", text)
+            if ords:
+                n = max(int(o) for o in ords)
 
         # 归属：我发的 / 我的
         if re.search(r"我\s*发?的", text):
@@ -467,7 +571,8 @@ class AutoImagePlugin(Star):
             return str(e)
 
         model, ratio, size = self._resolve_params(params_text, prompt)
-        ref_sources = list(ref_sources or [])
+        # 取用时再持久化一次，防止等待 / 排队间隙临时文件被清理
+        ref_sources = [self._repersist_at_collect(s) for s in (ref_sources or [])]
         fixed_mode = self.config.get("progress_msg_mode", "fixed") == "fixed"
 
         # 1) 尽早发送开始提示（fixed 模式）；llm 模式下由 bot 正常回话表达，插件不插话
@@ -478,7 +583,10 @@ class AutoImagePlugin(Star):
         if wait > 0:
             await asyncio.sleep(wait)
             if ref_collector is not None:
-                ref_sources = ref_collector() or ref_sources
+                ref_sources = [
+                    self._repersist_at_collect(s)
+                    for s in (ref_collector() or ref_sources)
+                ]
 
         if require_ref and not ref_sources:
             return NO_IMAGE_MSG
@@ -505,7 +613,8 @@ class AutoImagePlugin(Star):
             if not ref_data_urls and errors:
                 return (
                     f"⚠️ 参考图处理失败（本地文件与链接均不可用）: {errors[0]}。"
-                    "请提示用户重新发送图片后重试。"
+                    "请直接告知用户重新发送需要的图片后再试；不要调用 shell / 文件读写"
+                    "等工具在磁盘上查找或恢复图片，已失效的临时文件无法通过这种方式找回。"
                 )
             # 等待模式下补充一条参考图确认，避免用户对参考图是否生效存疑
             if fixed_mode and wait > 0 and ref_data_urls:
@@ -591,7 +700,7 @@ class AutoImagePlugin(Star):
                 f"图片已生成并发送给用户（共 {sent} 张，模型 {used_model}{switched}，比例 {ratio}"
                 + (f"，清晰度 {eff_size}" if eff_size else "")
                 + (f"，携带参考图 {len(ref_data_urls)} 张" if ref_data_urls else "")
-                + "。请用文字简单向用户确认即可，不要重复发送图片链接。"
+                + ")。请用文字简单向用户确认即可，不要重复发送图片链接。"
             )
         return "⚠️ 图片生成成功但发送失败，可稍后重试。"
 
@@ -610,7 +719,7 @@ class AutoImagePlugin(Star):
             sources = self._extract_image_sources(event)
             for src in sources:
                 self._recent.add(
-                    event.unified_msg_origin, self._persist_ref(src), sid, sname
+                    event.unified_msg_origin, await self._persist_ref(src), sid, sname
                 )
             if sources:
                 logger.info(
@@ -768,14 +877,18 @@ class AutoImagePlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
-        """插件卸载时清理临时文件"""
-        for d in (self.temp_dir, self.cache_dir):
-            try:
-                for f in d.iterdir():
-                    try:
-                        if f.is_file():
-                            f.unlink()
-                    except OSError:
-                        pass
-            except OSError:
-                pass
+        """插件卸载 / 热重载时清理生成的临时图片。
+
+        参考图缓存（temp/cache，含索引 recent_index.json）不在此清理：
+        它按缓存期自动清理，且需要在热重载 / 重启后继续可用——否则保存
+        一次配置就会让之前记录的图片全部失效。
+        """
+        try:
+            for f in self.temp_dir.iterdir():
+                try:
+                    if f.is_file():
+                        f.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
