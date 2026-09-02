@@ -134,7 +134,7 @@ class _RecentImages:
     "astrbot_plugin_auto_image",
     "Kimi",
     "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数关键词模糊匹配，失败自动切换备选模型，支持表情包/GIF 参考图（Grsai API）",
-    "1.3.1",
+    "1.3.2",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -291,11 +291,37 @@ class AutoImagePlugin(Star):
         return ""
 
     @staticmethod
+    def _extract_raw_mface(event: AstrMessageEvent) -> list[tuple[str, str]]:
+        """从原始消息中提取适配层未转换的 QQ 收藏/商城表情（mface 消息段）。
+
+        AstrBot 的 aiocqhttp 适配层只转换 image 段，mface（收藏表情/商城表情）
+        会被丢弃，这里直接解析 raw_message 兜底，把表情 URL 作为参考图来源。
+        """
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        segs = None
+        if isinstance(raw, dict):
+            segs = raw.get("message")
+        elif isinstance(raw, list):
+            segs = raw
+        if not isinstance(segs, list):
+            return []
+        out: list[tuple[str, str]] = []
+        for seg in segs:
+            if not isinstance(seg, dict) or seg.get("type") != "mface":
+                continue
+            data = seg.get("data") or {}
+            url = data.get("url") or ""
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                out.append((url, ""))
+        return out
+
+    @staticmethod
     def _extract_image_sources(event: AstrMessageEvent) -> list[tuple[str, str]]:
         """从当前消息 / 被回复的消息中提取参考图来源。
 
         每条返回 (url, file) 元组，两者可能只有一个有效；转换时本地文件
         优先、失败回退 URL（本地临时文件会被 AstrBot 定期清理）。
+        QQ 收藏/商城表情（mface）不会被适配层转成 Image，从原始消息兜底。
         """
         sources: list[tuple[str, str]] = []
 
@@ -314,6 +340,13 @@ class AutoImagePlugin(Star):
                 for sub in comp.chain or []:
                     if isinstance(sub, Image):
                         _pick(sub)
+
+        # mface 兜底（去重）
+        seen = {u for u, _ in sources if u}
+        for url, _f in AutoImagePlugin._extract_raw_mface(event):
+            if url not in seen:
+                sources.append((url, ""))
+                seen.add(url)
         return sources[:MAX_REF_IMAGES]
 
     @staticmethod
@@ -519,8 +552,13 @@ class AutoImagePlugin(Star):
         try:
             sid = self._sender_id(event)
             sname = self._sender_name(event)
-            for src in self._extract_image_sources(event):
+            sources = self._extract_image_sources(event)
+            for src in sources:
                 self._recent.add(event.unified_msg_origin, src, sid, sname)
+            if sources:
+                logger.info(
+                    f"[auto-image] 记录会话图片 {len(sources)} 张（发送者: {sname or sid}）"
+                )
         except Exception:
             pass
 
