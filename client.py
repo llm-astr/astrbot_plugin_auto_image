@@ -6,6 +6,7 @@
 
 import asyncio
 import base64
+import io
 import mimetypes
 import time
 from pathlib import Path
@@ -168,11 +169,30 @@ class GrsaiClient:
                 await asyncio.sleep(interval)
 
 
-async def to_data_url(session: aiohttp.ClientSession, src: str) -> str:
+def _gif_first_frame_to_png(data: bytes) -> bytes | None:
+    """提取 GIF 首帧并转为 PNG 字节；失败返回 None（调用方回退为原样传 GIF）"""
+    try:
+        from PIL import Image as PILImage
+
+        with PILImage.open(io.BytesIO(data)) as im:
+            im.seek(0)
+            frame = im.convert("RGBA")
+            buf = io.BytesIO()
+            frame.save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+async def to_data_url(
+    session: aiohttp.ClientSession, src: str, gif_mode: str = "first_frame"
+) -> str:
     """把参考图（http URL / 本地路径）转成 base64 data URL。
 
     Grsai API 对 QQ 等平台的多媒体链接经常拉取失败
     （image upload failed），统一先转成 data URL 再提交。
+    GIF 参考图：gif_mode=first_frame 时提取首帧转 PNG（兼容性最好）；
+    gif_mode=direct 时原样传 GIF（供测试 API 是否支持）。
     """
     mime = ""
     if src.startswith("file://"):
@@ -192,6 +212,14 @@ async def to_data_url(session: aiohttp.ClientSession, src: str) -> str:
 
     if len(data) > MAX_REF_IMAGE_SIZE:
         raise GrsaiAPIError("参考图大小超过 10MB 限制")
+
+    # GIF 处理：默认提取首帧转 PNG；direct 模式原样传递
+    is_gif = data[:6] in (b"GIF87a", b"GIF89a") or mime == "image/gif"
+    if is_gif and gif_mode != "direct":
+        png = _gif_first_frame_to_png(data)
+        if png:
+            data, mime = png, "image/png"
+
     if not mime.startswith("image/"):
         mime = "image/jpeg"
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"

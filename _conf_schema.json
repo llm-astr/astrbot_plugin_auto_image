@@ -68,6 +68,15 @@
     "type": "bool",
     "default": false
   },
+  "gif_handling": {
+    "description": "GIF 参考图处理方式：first_frame=提取首帧转为 PNG（默认，兼容性最好）；direct=直接传 GIF 原图（可自行测试 API 是否支持）",
+    "type": "string",
+    "default": "first_frame",
+    "options": [
+      "first_frame",
+      "direct"
+    ]
+  },
   "fallback_models": {
     "description": "备选模型列表，按顺序在生成失败时依次切换；可自由增减，仅限可用模型：nano-banana-fast / nano-banana / nano-banana-pro / nano-banana-pro-vt / nano-banana-pro-cl / nano-banana-pro-vip / nano-banana-pro-4k-vip / nano-banana-2 / nano-banana-2-cl / nano-banana-2-2k-cl / nano-banana-2-4k-cl / gpt-image-2 / gpt-image-2-vip",
     "type": "list",
@@ -79,7 +88,7 @@
     ]
   },
   "poll_timeout": {
-    "description": "每个模型等待生成结果的最长时间（秒）",
+    "description": "等待生成结果的最长时间（秒）",
     "type": "int",
     "default": 300
   },
