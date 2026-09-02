@@ -75,20 +75,43 @@ NO_IMAGE_MSG = (
 )
 
 
+async def _convert_ref(
+    session: aiohttp.ClientSession, src, gif_mode: str
+) -> str:
+    """把一条参考图来源转成 base64 data URL。
+
+    src 为 (url, file) 元组或字符串。元组时优先读本地文件（快、免下载），
+    本地文件不存在或读取失败时自动回退到 URL
+    （AstrBot 的 data/temp 临时文件会被清理，URL 存活期更长）。
+    """
+    if isinstance(src, str):
+        candidates = [src]
+    else:
+        url, file = src
+        candidates = [c for c in (file, url) if c]
+    last_exc: Exception | None = None
+    for cand in candidates:
+        try:
+            return await to_data_url(session, cand, gif_mode)
+        except Exception as e:
+            last_exc = e
+    raise last_exc or GrsaiAPIError("参考图来源为空")
+
+
 class _RecentImages:
     """按会话缓存用户最近发送的图片（时间有限、数量有限）。
 
-    每条记录为 (时间戳, 图片来源, 发送者ID, 发送者昵称)，
-    支持按发送人和张数挑选（如「我发的 3 张」「某某发的 2 张」）。
+    每条记录为 (时间戳, 图片来源, 发送者ID, 发送者昵称)，其中图片来源为
+    (url, file) 元组；支持按发送人和张数挑选（如「我发的 3 张」「某某发的 2 张」）。
     """
 
     def __init__(self, ttl: int, max_per_session: int):
         self.ttl = ttl
         self.max = max_per_session
-        # session -> [(ts, src, sender_id, sender_name)]
-        self._data: OrderedDict[str, list[tuple[float, str, str, str]]] = OrderedDict()
+        # session -> [(ts, (url, file), sender_id, sender_name)]
+        self._data: OrderedDict[str, list[tuple]] = OrderedDict()
 
-    def add(self, session: str, src: str, sender_id: str = "", sender_name: str = "") -> None:
+    def add(self, session: str, src, sender_id: str = "", sender_name: str = "") -> None:
         now = time.monotonic()
         lst = self._data.setdefault(session, [])
         lst.append((now, src, sender_id, sender_name))
@@ -97,13 +120,13 @@ class _RecentImages:
         if len(self._data) > 200:
             self._data.popitem(last=False)
 
-    def entries(self, session: str) -> list[tuple[float, str, str, str]]:
+    def entries(self, session: str) -> list[tuple]:
         """会话内未过期的全部记录，按发送时间升序（最早的在前）"""
         now = time.monotonic()
         lst = [e for e in self._data.get(session, []) if now - e[0] <= self.ttl]
         return sorted(lst, key=lambda e: e[0])
 
-    def latest(self, session: str, n: int = 1) -> list[str]:
+    def latest(self, session: str, n: int = 1) -> list:
         return [e[1] for e in self.entries(session)[-n:]]
 
 
@@ -111,7 +134,7 @@ class _RecentImages:
     "astrbot_plugin_auto_image",
     "Kimi",
     "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数关键词模糊匹配，失败自动切换备选模型，支持表情包/GIF 参考图（Grsai API）",
-    "1.3.0",
+    "1.3.1",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -166,8 +189,8 @@ class AutoImagePlugin(Star):
                 chain.append(m)
         return chain
 
-    def _collect_refs(self, event: AstrMessageEvent, hint_text: str = "") -> list[str]:
-        """收集参考图，优先级：
+    def _collect_refs(self, event: AstrMessageEvent, hint_text: str = "") -> list:
+        """收集参考图（每条为 (url, file) 元组），优先级：
         1. 当前消息 / 回复引用中的图片
         2. 按语义挑选：「我发的 N 张」→ 该用户最近 N 张；「某某（QQ昵称）发的 N 张」→ 昵称匹配
            会话缓存中该用户最近 N 张；均按发送时间升序（最早发的为第一张）
@@ -216,7 +239,7 @@ class AutoImagePlugin(Star):
         self,
         text: str,
         event: AstrMessageEvent,
-        entries: list[tuple[float, str, str, str]],
+        entries: list[tuple],
     ) -> tuple[int | None, str | None]:
         """从文本解析参考图语义：返回 (张数, 归属)。归属为 'me' 或昵称子串"""
         n: int | None = None
@@ -224,10 +247,14 @@ class AutoImagePlugin(Star):
         if not text:
             return n, owner
 
-        # 张数：「3张」「三张」「两幅」等
-        m = re.search(r"([0-9]+|[一二两三四五六七八])\s*[张幅个](?:图|图片|照片|表情包?)?", text)
+        # 张数：「3张」「三张」「两幅」等；排除「第一张」序数及「一张海报」这类产物描述
+        m = re.search(
+            r"(?<!第)([0-9]+|[一二两三四五六七八])\s*[张幅个](?:图|图片|照片|表情包?)"
+            r"|(?<=的)\s*[那这]?\s*([0-9]+|[一二两三四五六七八])\s*[张幅个]",
+            text,
+        )
         if m:
-            tok = m.group(1)
+            tok = m.group(1) or m.group(2)
             n = int(tok) if tok.isdigit() else _CN_DIGITS.get(tok)
 
         # 归属：我发的 / 我的
@@ -264,14 +291,21 @@ class AutoImagePlugin(Star):
         return ""
 
     @staticmethod
-    def _extract_image_sources(event: AstrMessageEvent) -> list[str]:
-        """从当前消息 / 被回复的消息中提取参考图来源（URL 或本地路径）"""
-        sources: list[str] = []
+    def _extract_image_sources(event: AstrMessageEvent) -> list[tuple[str, str]]:
+        """从当前消息 / 被回复的消息中提取参考图来源。
+
+        每条返回 (url, file) 元组，两者可能只有一个有效；转换时本地文件
+        优先、失败回退 URL（本地临时文件会被 AstrBot 定期清理）。
+        """
+        sources: list[tuple[str, str]] = []
 
         def _pick(comp) -> None:
-            src = comp.url or comp.file
-            if src:
-                sources.append(src)
+            url = getattr(comp, "url", None) or ""
+            file = getattr(comp, "file", None) or ""
+            if file.startswith("file://"):
+                file = file[7:]
+            if url or file:
+                sources.append((url, file))
 
         for comp in event.get_messages():
             if isinstance(comp, Image):
@@ -334,7 +368,7 @@ class AutoImagePlugin(Star):
         event: AstrMessageEvent,
         prompt: str,
         params_text: str,
-        ref_sources: list[str] | None = None,
+        ref_sources: list | None = None,
         ref_collector=None,
         wait: int = 0,
         require_ref: bool = False,
@@ -365,7 +399,8 @@ class AutoImagePlugin(Star):
         if require_ref and not ref_sources:
             return NO_IMAGE_MSG
 
-        # 3) 参考图并行下载并转成 base64 data URL，避免 API 拉不动平台图链
+        # 3) 参考图并行转成 base64 data URL，避免 API 拉不动平台图链；
+        #    本地临时文件失效时自动回退到 URL 下载
         gif_mode = self.config.get("gif_handling", "first_frame")
         ref_data_urls: list[str] = []
         if ref_sources:
@@ -374,7 +409,7 @@ class AutoImagePlugin(Star):
             ) as session:
                 results = await asyncio.gather(
                     *(
-                        to_data_url(session, src, gif_mode)
+                        _convert_ref(session, src, gif_mode)
                         for src in ref_sources[:MAX_REF_IMAGES]
                     ),
                     return_exceptions=True,
@@ -384,7 +419,10 @@ class AutoImagePlugin(Star):
             if errors:
                 logger.warning(f"[auto-image] {len(errors)} 张参考图处理失败: {errors[0]}")
             if not ref_data_urls and errors:
-                return f"⚠️ 参考图处理失败: {errors[0]}"
+                return (
+                    f"⚠️ 参考图处理失败（本地文件与链接均不可用）: {errors[0]}。"
+                    "请提示用户重新发送图片后重试。"
+                )
             # 等待模式下补充一条参考图确认，避免用户对参考图是否生效存疑
             if fixed_mode and wait > 0 and ref_data_urls:
                 try:
