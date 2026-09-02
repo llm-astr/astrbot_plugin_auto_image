@@ -1,5 +1,5 @@
 name: astrbot_plugin_auto_image
 desc: LLM 自主生图/改图插件：bot 根据对话自主调用文生图/图生图，参数支持关键词模糊匹配（模型/比例/1K-4K），Grsai API
-version: v1.3.1
+version: v1.3.2
 author: Kimi
 repo: https://github.com/llm-astr/astrbot_plugin_auto_image
