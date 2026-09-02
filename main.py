@@ -14,6 +14,7 @@ AstrBot 插件：LLM 自主生图 / 改图（Grsai API）
 
 import asyncio
 import re
+import shutil
 import sys
 import uuid
 import time
@@ -134,7 +135,7 @@ class _RecentImages:
     "astrbot_plugin_auto_image",
     "Kimi",
     "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数关键词模糊匹配，失败自动切换备选模型，支持表情包/GIF 参考图（Grsai API）",
-    "1.3.3",
+    "1.3.4",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -143,6 +144,8 @@ class AutoImagePlugin(Star):
         self.config = config
         self.temp_dir = Path(__file__).parent / "temp"
         self.temp_dir.mkdir(exist_ok=True)
+        self.cache_dir = self.temp_dir / "cache"
+        self.cache_dir.mkdir(exist_ok=True)
         self._recent = _RecentImages(RECENT_TTL, RECENT_MAX)
 
     # ---------------- 工具方法 ----------------
@@ -188,6 +191,41 @@ class AutoImagePlugin(Star):
             if m not in chain:
                 chain.append(m)
         return chain
+
+    def _persist_ref(self, src) -> tuple:
+        """持久化参考图来源：把本地临时文件复制到插件目录。
+
+        AstrBot 的 data/temp 媒体文件几分钟内就会被清理、QQ 多媒体链接
+        （带 rkey）也会过期；消息刚收到时本地文件一定还在，复制一份到插件
+        自己的 cache 目录，保证缓存期内随时可取。
+        """
+        if not isinstance(src, tuple):
+            return src
+        url, file = src
+        if file:
+            p = Path(file)
+            try:
+                if p.is_file():
+                    suffix = p.suffix or ".jpg"
+                    dst = self.cache_dir / f"{uuid.uuid4().hex}{suffix}"
+                    shutil.copyfile(p, dst)
+                    return (url, str(dst))
+            except OSError:
+                pass
+        return src
+
+    def _purge_cache(self) -> None:
+        """清理插件 cache 目录中超过缓存期的复制文件"""
+        try:
+            now = time.time()
+            for f in self.cache_dir.iterdir():
+                try:
+                    if f.is_file() and now - f.stat().st_mtime > RECENT_TTL:
+                        f.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     def _collect_refs(self, event: AstrMessageEvent, hint_text: str = "") -> list:
         """收集参考图（每条为 (url, file) 元组），优先级：
@@ -561,17 +599,24 @@ class AutoImagePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def record_recent_images(self, event: AstrMessageEvent):
-        """被动记录会话中的图片（含发送者信息），供改图/语义取图使用"""
+        """被动记录会话中的图片（含发送者信息），供改图/语义取图使用。
+
+        记录时把本地临时文件复制到插件目录持久化，防止 AstrBot 清理临时
+        文件或平台图链过期后无法取用。
+        """
         try:
             sid = self._sender_id(event)
             sname = self._sender_name(event)
             sources = self._extract_image_sources(event)
             for src in sources:
-                self._recent.add(event.unified_msg_origin, src, sid, sname)
+                self._recent.add(
+                    event.unified_msg_origin, self._persist_ref(src), sid, sname
+                )
             if sources:
                 logger.info(
                     f"[auto-image] 记录会话图片 {len(sources)} 张（发送者: {sname or sid}）"
                 )
+            self._purge_cache()
         except Exception:
             pass
 
@@ -724,8 +769,13 @@ class AutoImagePlugin(Star):
 
     async def terminate(self):
         """插件卸载时清理临时文件"""
-        try:
-            for f in self.temp_dir.glob("*.jpg"):
-                f.unlink()
-        except Exception:
-            pass
+        for d in (self.temp_dir, self.cache_dir):
+            try:
+                for f in d.iterdir():
+                    try:
+                        if f.is_file():
+                            f.unlink()
+                    except OSError:
+                        pass
+            except OSError:
+                pass
