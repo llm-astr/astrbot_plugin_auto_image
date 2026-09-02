@@ -6,6 +6,7 @@ AstrBot 插件：LLM 自主生图 / 改图（Grsai API）
 - 生图参数（模型 / 比例 / 1K-4K 清晰度）支持关键词模糊匹配，如「pro」「横版」「4K」
 - 开始生成提示可切换：插件固定提示语（默认）/ 由 bot 以正常回话方式表达
 - 可配置识别到生图意图后的等待时间，便于接收用户随后发送的参考图，防止遗漏
+- 可选失败自动切换：生成失败时按自定义顺序依次切换备选模型重试
 - 保留 /生图 /改图 /生图模型 指令，用于精确控制
 """
 
@@ -30,6 +31,7 @@ except ImportError:  # 兼容旧版本 AstrBot
 
 if __package__:
     from .client import (
+        IMAGE_MODELS,
         IMAGE_SIZE_MODELS,
         MAX_REF_IMAGES,
         GrsaiAPIError,
@@ -41,6 +43,7 @@ if __package__:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from client import (
+        IMAGE_MODELS,
         IMAGE_SIZE_MODELS,
         MAX_REF_IMAGES,
         GrsaiAPIError,
@@ -91,8 +94,8 @@ class _RecentImages:
 @register(
     "astrbot_plugin_auto_image",
     "Kimi",
-    "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数支持关键词模糊匹配（Grsai API）",
-    "1.1.0",
+    "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数支持关键词模糊匹配，失败可自动切换备选模型（Grsai API）",
+    "1.2.0",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -129,6 +132,23 @@ class AutoImagePlugin(Star):
             return max(0, min(60, int(self.config.get("wait_before_generate", 0))))
         except (TypeError, ValueError):
             return 0
+
+    def _fallback_chain(self, primary: str) -> list[str]:
+        """生成失败时的模型尝试链：[当前模型] + 备选模型（去重、剔除不可用项）"""
+        chain = [primary]
+        if not self.config.get("auto_fallback", False):
+            return chain
+        raw = self.config.get("fallback_models", []) or []
+        for m in raw:
+            m = str(m).strip()
+            if not m:
+                continue
+            if m not in IMAGE_MODELS:
+                logger.warning(f"[auto-image] 备选模型 {m} 不在可用列表，已跳过")
+                continue
+            if m not in chain:
+                chain.append(m)
+        return chain
 
     def _collect_refs(self, event: AstrMessageEvent) -> list[str]:
         """收集参考图：当前消息 / 回复引用 优先，其次会话最近图片"""
@@ -265,22 +285,46 @@ class AutoImagePlugin(Star):
                 except Exception:
                     pass
 
-        # 4) 提交任务并轮询结果
-        try:
-            image_urls = await client.generate(
-                model=model,
-                prompt=prompt,
-                aspect_ratio=ratio,
-                image_size=size,
-                urls=ref_data_urls,
-                timeout=int(self.config.get("poll_timeout", 300)),
-                interval=float(self.config.get("poll_interval", 4)),
-            )
-        except GrsaiAPIError as e:
-            return f"⚠️ {e}"
-        except Exception as e:
-            logger.exception("[auto-image] 生图异常")
-            return f"⚠️ 生图出现异常: {e}"
+        # 4) 提交任务并轮询结果；开启 auto_fallback 时失败按备选顺序切换模型重试
+        chain = self._fallback_chain(model)
+        image_urls: list[str] | None = None
+        used_model = model
+        last_err: Exception | None = None
+        for idx, cur in enumerate(chain):
+            cur_size = size if cur in IMAGE_SIZE_MODELS else None
+            if idx > 0:
+                logger.warning(
+                    f"[auto-image] 模型 {chain[idx - 1]} 生成失败，切换 {cur} 重试: {last_err}"
+                )
+                if fixed_mode:
+                    try:
+                        await self._send(
+                            event,
+                            [Plain(f"🔁 {chain[idx - 1]} 生成失败，切换 {cur} 重试……")],
+                        )
+                    except Exception:
+                        pass
+            try:
+                image_urls = await client.generate(
+                    model=cur,
+                    prompt=prompt,
+                    aspect_ratio=ratio,
+                    image_size=cur_size,
+                    urls=ref_data_urls,
+                    timeout=int(self.config.get("poll_timeout", 300)),
+                    interval=float(self.config.get("poll_interval", 4)),
+                )
+                used_model = cur
+                break
+            except GrsaiAPIError as e:
+                last_err = e
+            except Exception as e:
+                logger.exception("[auto-image] 生图异常")
+                last_err = e
+
+        if image_urls is None:
+            tried = " → ".join(chain)
+            return f"⚠️ 生成失败（已依次尝试 {tried}）: {last_err}"
 
         # 5) 下载并发送图片
         sent = 0
@@ -307,9 +351,13 @@ class AutoImagePlugin(Star):
                     pass
 
         if sent:
+            eff_size = size if used_model in IMAGE_SIZE_MODELS else None
+            switched = (
+                f"（原模型 {model} 失败，已自动切换）" if used_model != model else ""
+            )
             return (
-                f"图片已生成并发送给用户（共 {sent} 张，模型 {model}，比例 {ratio}"
-                + (f"，清晰度 {size}" if size else "")
+                f"图片已生成并发送给用户（共 {sent} 张，模型 {used_model}{switched}，比例 {ratio}"
+                + (f"，清晰度 {eff_size}" if eff_size else "")
                 + (f"，携带参考图 {len(ref_data_urls)} 张" if ref_data_urls else "")
                 + "。请用文字简单向用户确认即可，不要重复发送图片链接。"
             )
