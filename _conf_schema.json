@@ -87,6 +87,21 @@
       "gpt-image-2"
     ]
   },
+  "preset_avatar_ref": {
+    "description": "预设①：消息包含「用他画/用她画/用它画/用他做/用她做/用它做」且 @ 了某人时，自动提取被@者的 QQ 头像作为默认参考图",
+    "type": "bool",
+    "default": true
+  },
+  "preset_prompt_gallery": {
+    "description": "预设②提示词图库：生图/改图要求中包含图库设定的预设提示词时，自动把对应图片作为参考图，并按序数在提示词中强调第几张是哪个预设提示词（图库在 WebUI 插件页面或用 /图库 指令管理）",
+    "type": "bool",
+    "default": true
+  },
+  "preset_gallery_strip_features": {
+    "description": "预设②命中时拦截人物特征描述：自动移除 LLM 提示词中的外观描述（发色/瞳色/耳尾/服饰/体型等），避免文字描述盖过参考图；含「改成/换成/穿上/去掉」等改动意图的子句会保留，/生图 /改图 指令中手写的提示词不拦截",
+    "type": "bool",
+    "default": true
+  },
   "poll_timeout": {
     "description": "等待生成结果的最长时间（秒）",
     "type": "int",

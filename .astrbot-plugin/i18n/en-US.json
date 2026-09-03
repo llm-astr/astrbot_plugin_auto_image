@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "gallery": {
+      "title": "Prompt Gallery",
+      "description": "Bind preset prompt keywords to images. When a generate/edit request mentions a keyword, the matched image is attached as a reference automatically, with its ordinal emphasized in the prompt."
+    }
+  }
+}
