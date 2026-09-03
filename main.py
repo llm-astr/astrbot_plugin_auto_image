@@ -998,7 +998,7 @@ class AutoImagePlugin(Star):
                 f"图片已生成并发送给用户（共 {sent} 张，模型 {used_model}{switched}，比例 {ratio}"
                 + (f"，清晰度 {eff_size}" if eff_size else "")
                 + (f"，携带参考图 {len(ref_data_urls)} 张" if ref_data_urls else "")
-                + "。请用文字简单向用户确认即可，不要重复发送图片链接。"
+                + "）。请用文字简单向用户确认即可，不要重复发送图片链接。"
             )
         return "⚠️ 图片生成成功但发送失败，可稍后重试。"
 
