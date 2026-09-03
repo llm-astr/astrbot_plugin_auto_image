@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>提示词图库</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="head">
+        <h1 id="page-title">提示词图库</h1>
+        <p class="desc" id="page-desc">
+          为每张图片绑定预设提示词；生图 / 改图要求中提到这些词时，机器人会自动带上对应图片作为参考图，并在提示词里按序数强调「第几张是什么」。
+        </p>
+      </header>
+
+      <section class="card add-card">
+        <h2 id="add-title">添加图库图片</h2>
+        <div class="add-form">
+          <div class="field">
+            <label id="kw-label" for="kw-input">预设提示词（多个用空格 / 逗号分隔）</label>
+            <input
+              id="kw-input"
+              type="text"
+              placeholder="例如：猫娘 女仆装"
+              autocomplete="off"
+            />
+          </div>
+          <div class="field">
+            <label id="img-label">图片（jpg / png / webp / gif，≤15MB）</label>
+            <div class="file-row">
+              <button type="button" class="btn" id="pick-btn">选择图片</button>
+              <span class="file-name" id="file-name">未选择</span>
+            </div>
+            <input id="file-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden />
+            <img id="preview" class="preview hidden" alt="预览" />
+          </div>
+          <button type="button" class="btn primary" id="add-btn">添加到图库</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="list-head">
+          <h2 id="list-title">已收录</h2>
+          <button type="button" class="btn ghost" id="refresh-btn">刷新</button>
+        </div>
+        <div id="empty" class="empty hidden">图库还是空的，先添加一张吧。</div>
+        <div id="grid" class="grid"></div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
