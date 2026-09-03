@@ -10,6 +10,9 @@ AstrBot 插件：LLM 自主生图 / 改图（Grsai API）
 - 支持表情包引用：图片表情自动作参考图，小黄脸表情转为提示词；GIF 默认提取首帧（可切 direct 实测）
 - 支持按语义取图：「我发的 N 张」「某某发的 N 张」「图1/图2」序数取图，按发送时间升序作为参考图
 - 参考图与缓存索引落盘，插件热重载 / 保存配置 / 重启后缓存不丢失
+- 预设系统（presets.py 可扩展）：预设①「用他/她/它 画/做」+ @某人 → 被@者头像作默认参考图
+- 预设②提示词图库：上传图片并绑定预设提示词，生图/改图要求命中关键词时自动带图并按序数强调
+- 插件页面（AstrBot Pages）：WebUI 中可视化管理提示词图库（上传/编辑/删除），老版本可用 /图库 指令
 - 保留 /生图 /改图 /生图模型 指令，用于精确控制
 """
 
@@ -51,6 +54,20 @@ if __package__:
         to_data_url,
     )
     from .fuzzy import ALLOWED_MODELS, match_model, match_ratio, match_size, strip_param_words
+    from .gallery import (
+        EXT_MIME,
+        PromptGallery,
+        default_gallery_dir,
+        guess_ext,
+        sanitize_keywords,
+        sniff_ext,
+    )
+    from .presets import (
+        GalleryPreset,
+        match_presets,
+        register_preset,
+        strip_character_features,
+    )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from client import (
@@ -63,11 +80,41 @@ else:
         to_data_url,
     )
     from fuzzy import ALLOWED_MODELS, match_model, match_ratio, match_size, strip_param_words
+    from gallery import (
+        EXT_MIME,
+        PromptGallery,
+        default_gallery_dir,
+        guess_ext,
+        sanitize_keywords,
+        sniff_ext,
+    )
+    from presets import (
+        GalleryPreset,
+        match_presets,
+        register_preset,
+        strip_character_features,
+    )
+
+# 插件 Pages 后端 Web API（AstrBot 较新版本支持；老版本缺失时自动降级为仅指令管理图库）
+try:
+    from astrbot.api.web import (
+        PluginUploadFile,
+        error_response,
+        json_response,
+        request as web_request,
+    )
+
+    _WEB_API_OK = True
+except Exception:
+    PluginUploadFile = None
+    _WEB_API_OK = False
 
 # 会话图片缓存：改图工具自动取最近图片
 RECENT_TTL = 600      # 缓存 10 分钟
 RECENT_MAX = 16       # 每个会话最多记 16 张（供按发送人/张数挑选）
 EDIT_REF_COUNT = 4    # 改图时默认最多携带最近 4 张
+
+PLUGIN_NAME = "astrbot_plugin_auto_image"
 
 # 中文数字 → 数量
 _CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
@@ -203,7 +250,7 @@ class _RecentImages:
     "astrbot_plugin_auto_image",
     "Kimi",
     "LLM 自主生图/改图：bot 根据对话自主调用文生图/图生图，参数关键词模糊匹配，失败自动切换备选模型，支持表情包/GIF 参考图（Grsai API）",
-    "1.3.5",
+    "1.6.0",
     "https://github.com/llm-astr/astrbot_plugin_auto_image",
 )
 class AutoImagePlugin(Star):
@@ -217,6 +264,132 @@ class AutoImagePlugin(Star):
         self._recent = _RecentImages(
             RECENT_TTL, RECENT_MAX, self.cache_dir / "recent_index.json"
         )
+        # 提示词图库（预设②）：插件数据目录持久化，插件更新不丢失
+        self.gallery = PromptGallery(default_gallery_dir())
+        register_preset(GalleryPreset(self.gallery))
+        logger.info(
+            f"[auto-image] 提示词图库已加载 {len(self.gallery.list_items())} 张（{self.gallery.dir}）"
+        )
+        # 插件页面（AstrBot Pages）后端 API：老版本 AstrBot 无此能力时自动跳过，
+        # 图库仍可通过 /图库 /图库添加 /图库删除 指令管理
+        if _WEB_API_OK and hasattr(context, "register_web_api"):
+            try:
+                self._register_web_apis(context)
+            except Exception as e:
+                logger.warning(f"[auto-image] 插件页面 API 注册失败（不影响图库指令使用）: {e}")
+
+    # ---------------- 插件页面 Web API（提示词图库管理） ----------------
+
+    def _register_web_apis(self, context: Context) -> None:
+        """注册图库管理 API，供 pages/gallery 页面通过 bridge 调用"""
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/gallery/list", self.api_gallery_list, ["GET"], "图库列表"
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/gallery/thumb/<item_id>",
+            self.api_gallery_thumb,
+            ["GET"],
+            "图库缩略图",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/gallery/create", self.api_gallery_create, ["POST"], "新建图库条目"
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/gallery/upload/<item_id>",
+            self.api_gallery_upload,
+            ["POST"],
+            "上传图库图片",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/gallery/update", self.api_gallery_update, ["POST"], "修改预设提示词"
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/gallery/delete", self.api_gallery_delete, ["POST"], "删除图库条目"
+        )
+
+    async def api_gallery_list(self):
+        return json_response({"items": self.gallery.list_items()})
+
+    async def api_gallery_thumb(self, item_id: str):
+        item = self.gallery.get(item_id)
+        if item is None or not item.get("file"):
+            return error_response("图片不存在", status_code=404)
+        p = self.gallery.image_path(item)
+        if not p.is_file():
+            return error_response("图片文件已丢失", status_code=404)
+        mime = EXT_MIME.get(p.suffix.lower(), "image/jpeg")
+        try:
+            import base64
+
+            data_url = f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()
+        except OSError:
+            return error_response("图片读取失败", status_code=500)
+        return json_response({"data_url": data_url})
+
+    async def api_gallery_create(self):
+        payload = await web_request.json(default={})
+        keywords = sanitize_keywords(
+            payload.get("keywords") if isinstance(payload, dict) else None
+        )
+        if not keywords:
+            return error_response("至少需要 1 个有效的预设提示词", status_code=400)
+        try:
+            item = self.gallery.create(keywords)
+        except ValueError as e:
+            return error_response(str(e), status_code=400)
+        logger.info(f"[auto-image] 图库新增条目 {item['id']}（关键词: {'/'.join(item['keywords'])}）")
+        return json_response({"item": self._gallery_item_view(item)})
+
+    async def api_gallery_upload(self, item_id: str):
+        files = await web_request.files()
+        upload = files.get("file")
+        if PluginUploadFile is None or not isinstance(upload, PluginUploadFile):
+            return error_response("缺少上传文件", status_code=400)
+        ext = guess_ext(upload.filename, upload.content_type)
+        if not ext:
+            return error_response("不支持的图片格式（仅 jpg / png / webp / gif）", status_code=400)
+        try:
+            target = self.gallery.candidate_path(item_id, ext)
+        except (KeyError, ValueError) as e:
+            return error_response(str(e), status_code=400)
+        await upload.save(target)
+        try:
+            item = self.gallery.attach_saved(item_id, target)
+        except (KeyError, ValueError) as e:
+            return error_response(str(e), status_code=400)
+        logger.info(f"[auto-image] 图库条目 {item_id} 图片已更新")
+        return json_response({"item": self._gallery_item_view(item)})
+
+    async def api_gallery_update(self):
+        payload = await web_request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求格式错误", status_code=400)
+        try:
+            item = self.gallery.set_keywords(
+                str(payload.get("id") or ""), payload.get("keywords")
+            )
+        except KeyError:
+            return error_response("图库条目不存在", status_code=404)
+        except ValueError as e:
+            return error_response(str(e), status_code=400)
+        return json_response({"item": self._gallery_item_view(item)})
+
+    async def api_gallery_delete(self):
+        payload = await web_request.json(default={})
+        item_id = str(payload.get("id") or "") if isinstance(payload, dict) else ""
+        if not self.gallery.remove(item_id):
+            return error_response("图库条目不存在", status_code=404)
+        logger.info(f"[auto-image] 图库条目 {item_id} 已删除")
+        return json_response({"deleted": True})
+
+    def _gallery_item_view(self, item: dict) -> dict:
+        return {
+            "id": item["id"],
+            "keywords": list(item.get("keywords", [])),
+            "ts": item.get("ts", 0),
+            "has_image": bool(item.get("file"))
+            and self.gallery.image_path(item).is_file(),
+        }
 
     # ---------------- 工具方法 ----------------
 
@@ -322,22 +495,147 @@ class AutoImagePlugin(Star):
         except OSError:
             pass
 
-    def _collect_refs(self, event: AstrMessageEvent, hint_text: str = "") -> list:
+    async def _gallery_fetch_bytes(self, src) -> tuple[bytes, str]:
+        """把 (url, file) 图片来源读取为字节，返回 (data, ext)。
+
+        本地临时文件可能尚未落盘（适配器异步下载），做短暂重试；
+        扩展名依次从 魔数 / 文件名 / Content-Type 识别，均失败时报错。
+        """
+        url, file = src if isinstance(src, tuple) else (str(src), "")
+        if file:
+            p = Path(file)
+            for attempt in range(4):
+                try:
+                    if p.is_file() and p.stat().st_size > 0:
+                        data = p.read_bytes()
+                        ext = sniff_ext(data) or guess_ext(p.name)
+                        if not ext:
+                            raise GrsaiAPIError("无法识别图片格式（仅支持 jpg / png / webp / gif）")
+                        return data, ext
+                except OSError:
+                    pass
+                if attempt < 3:
+                    await asyncio.sleep(0.4)
+        if url:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        ext = sniff_ext(data) or guess_ext(
+                            url, resp.headers.get("Content-Type", "")
+                        )
+                        if not ext:
+                            raise GrsaiAPIError("无法识别图片格式（仅支持 jpg / png / webp / gif）")
+                        return data, ext
+        raise GrsaiAPIError("图片读取失败，请重新发送图片后再试")
+
+    def _match_hits(self, event: AstrMessageEvent, extra_text: str = "") -> list:
+        """匹配消息预设（见 presets.py），返回命中列表；异常时视为未命中。
+
+        extra_text：生图/改图入口的实际生成提示词，图库类预设会一并匹配它，
+        避免用户措辞与预设提示词有出入时漏匹配。
+        """
+        try:
+            return match_presets(event, self.config, extra_text=extra_text)
+        except Exception:
+            return []
+
+    def _apply_presets(self, event: AstrMessageEvent, extra_text: str = "") -> tuple[list, str]:
+        """匹配消息预设，返回 (补充的参考图来源列表, 提示词补充)。
+
+        多个预设同时命中时按预设顺序合并参考图，并把每张图的说明（labels）
+        按全局顺序合成「第 N 张是…」的序数提示：预设参考图在所有收集路径中
+        都排在参考图列表最前（见 _collect_refs / 各入口），序数与实际发送
+        给生图 API 的参考图顺序一致。
+        """
+        refs: list = []
+        labels: list[str] = []
+        extra_hints: list[str] = []
+        hits = self._match_hits(event, extra_text=extra_text)
+        for hit in hits:
+            rs = list(hit.refs or [])
+            ls = list(getattr(hit, "labels", None) or [])
+            ls += [""] * (len(rs) - len(ls))
+            refs.extend(rs)
+            labels.extend(ls[: len(rs)])
+            if hit.prompt_hint:
+                extra_hints.append(hit.prompt_hint)
+            logger.info(
+                f"[auto-image] 命中预设 {hit.preset_id}，补充参考图 {len(rs)} 张"
+            )
+        refs = refs[:MAX_REF_IMAGES]
+        labels = labels[: len(refs)]
+        hint = ""
+        if refs:
+            parts = [
+                f"第 {i + 1} 张是{labels[i]}" for i in range(len(refs)) if labels[i]
+            ]
+            if parts:
+                hint = (
+                    f"（系统已自动附加 {len(refs)} 张预设参考图，位于参考图列表最前："
+                    + "；".join(parts)
+                    + "。这些预设参考图直接作为生成依据，图中人物/物体的形象与外观特征"
+                    "一律以参考图为准，不要按文字描述另行想象或修改；"
+                    "请在提示词中按此序数对应各参考图）"
+                )
+        hint += "".join(extra_hints)
+        return refs, hint, hits
+
+    def _maybe_strip_features(self, prompt: str, hits: list) -> str:
+        """预设②（提示词图库）命中且开启拦截时，移除 LLM 提示词中的人物外观
+        特征描述子句（发色/瞳色/耳尾/服饰等，见 presets.strip_character_features），
+        让生图模型以参考图为准，不被文字描述带偏。
+
+        含「改成/换成/穿上/加上/去掉」等改动意图词的子句会保留，
+        因此「把猫娘换成婚纱」这类修改需求不受影响；/生图 /改图 指令中
+        用户手写的提示词不拦截。
+        """
+        if not any(h.preset_id == "prompt_gallery" for h in hits):
+            return prompt
+        try:
+            if not self.config.get("preset_gallery_strip_features", True):
+                return prompt
+        except Exception:
+            pass
+        cleaned, dropped = strip_character_features(prompt)
+        if dropped:
+            logger.info(
+                f"[auto-image] 已拦截人物特征描述 {len(dropped)} 段：{' | '.join(dropped)[:120]}"
+            )
+        return cleaned
+
+    def _collect_refs(
+        self,
+        event: AstrMessageEvent,
+        hint_text: str = "",
+        preset_refs: list | None = None,
+    ) -> list:
         """收集参考图（每条为 (url, file) 元组），优先级：
+        0. 预设补充（如「用他/她/它画」+ @某人 → 被@者头像）
         1. 当前消息 / 回复引用中的图片
         2. 按语义挑选：「我发的 N 张」→ 该用户最近 N 张；「某某（QQ昵称）发的 N 张」→ 昵称匹配
            会话缓存中该用户最近 N 张；均按发送时间升序（最早发的为第一张）
         3. 无语义提示时：会话最近图片（最多 EDIT_REF_COUNT 张，升序）
+        预设给出默认参考图且无其他取图语义时，不再叠加会话缓存图片，避免混入无关图。
+        preset_refs 可由调用方预先匹配好传入，避免重复匹配预设。
         """
+        if preset_refs is None:
+            preset_refs, _hint, _hits = self._apply_presets(event)
         refs = self._extract_image_sources(event)
         if refs:
-            return refs
+            return (preset_refs + refs)[:MAX_REF_IMAGES]
 
         entries = self._recent.entries(event.unified_msg_origin)
-        if not entries:
-            return []
+        n, owner = (
+            self._parse_ref_hint(hint_text, event, entries)
+            if entries
+            else (None, None)
+        )
+        if not entries or (preset_refs and not n and not owner):
+            return preset_refs[:MAX_REF_IMAGES]
 
-        n, owner = self._parse_ref_hint(hint_text, event, entries)
         pool = entries
         if owner == "me":
             sid = self._sender_id(event)
@@ -354,7 +652,7 @@ class AutoImagePlugin(Star):
             # 未指明张数（含「我发的」这类只指归属的说法）时按默认张数截取，
             # 避免把缓存期内的陈旧图片一并带上
             pool = pool[-EDIT_REF_COUNT:]
-        return [e[1] for e in pool[:MAX_REF_IMAGES]]
+        return (preset_refs + [e[1] for e in pool])[:MAX_REF_IMAGES]
 
     @staticmethod
     def _sender_id(event: AstrMessageEvent) -> str:
@@ -700,7 +998,7 @@ class AutoImagePlugin(Star):
                 f"图片已生成并发送给用户（共 {sent} 张，模型 {used_model}{switched}，比例 {ratio}"
                 + (f"，清晰度 {eff_size}" if eff_size else "")
                 + (f"，携带参考图 {len(ref_data_urls)} 张" if ref_data_urls else "")
-                + ")。请用文字简单向用户确认即可，不要重复发送图片链接。"
+                + "。请用文字简单向用户确认即可，不要重复发送图片链接。"
             )
         return "⚠️ 图片生成成功但发送失败，可稍后重试。"
 
@@ -717,6 +1015,12 @@ class AutoImagePlugin(Star):
             sid = self._sender_id(event)
             sname = self._sender_name(event)
             sources = self._extract_image_sources(event)
+            # 预设补充的参考图（如被@者头像）一并记录，供后续轮次的工具调用取用；
+            # record=False 的预设（如提示词图库）图片长期有效，不写入会话缓存，
+            # 避免污染「我发的图」等语义取图
+            for hit in self._match_hits(event):
+                if getattr(hit, "record", True):
+                    sources.extend(hit.refs)
             for src in sources:
                 self._recent.add(
                     event.unified_msg_origin, await self._persist_ref(src), sid, sname
@@ -733,46 +1037,52 @@ class AutoImagePlugin(Star):
 
     @filter.llm_tool(name="auto_text_to_image")
     async def tool_text_to_image(
-        self, event: AstrMessageEvent, prompt: str, params: str = ""
+        self, event: AstrMessageEvent, prompt: str = "", params: str = ""
     ):
         """根据文字描述生成一张全新的图片（文生图）。当用户想让你画图、生成图片、设计海报/壁纸/头像/表情包等新图像时，调用此工具。
 
         Args:
-            prompt(string): 对目标图片的详细描述，请基于用户意图扩充细节（主体、风格、构图、色彩、氛围等），描述越丰富效果越好。
+            prompt(string): 对目标图片的详细描述，请基于用户意图扩充细节（主体、风格、构图、色彩、氛围等），描述越丰富效果越好。必填。
             params(string): 用户对生成参数的要求原文，如模型、画面比例、清晰度，例如 "用pro模型画横版4K"；用户没有特殊要求时留空，系统会自动模糊匹配并回退到默认参数。
         """
         prompt = (prompt or "").strip()
         prompt += self._extract_face_hint(event)
         if not prompt:
-            return "缺少图片描述，请根据用户需求补充 prompt 后重新调用。"
+            return "缺少图片描述：上次调用没有携带 prompt 参数，请根据用户需求补充详细的 prompt 后重新调用本工具。"
+        preset_refs, preset_hint, hits = self._apply_presets(event, extra_text=prompt)
+        prompt = self._maybe_strip_features(prompt, hits)
+        prompt += preset_hint
         logger.info(f"[auto-image] LLM 触发文生图: {prompt[:80]} params={params!r}")
         hint_text = f"{event.message_str} {prompt}"
         return await self._generate_and_send(
             event,
             prompt,
             params or "",
-            ref_sources=self._extract_image_sources(event),
+            ref_sources=preset_refs + self._extract_image_sources(event),
             ref_collector=lambda: self._collect_refs(event, hint_text),
             wait=self._wait_seconds(),
         )
 
     @filter.llm_tool(name="auto_image_edit")
     async def tool_image_edit(
-        self, event: AstrMessageEvent, prompt: str, params: str = ""
+        self, event: AstrMessageEvent, prompt: str = "", params: str = ""
     ):
         """修改或编辑一张已有的图片（图生图 / 改图），例如换风格、改颜色、添加或去除元素、换背景、动漫化等。原图会自动取自用户当前消息携带的图片、回复引用的图片、或本会话中最近发送的图片，无需也无法手动指定图片地址。
 
         Args:
-            prompt(string): 对修改要求的详细描述，说明要改成什么样。
+            prompt(string): 对修改要求的详细描述，说明要改成什么样。必填。
             params(string): 用户对生成参数的要求原文（模型/比例/清晰度），例如 "竖版 高清"；没有特殊要求时留空。
         """
         prompt = (prompt or "").strip()
         prompt += self._extract_face_hint(event)
         if not prompt:
-            return "缺少修改要求描述，请根据用户需求补充 prompt 后重新调用。"
+            return "缺少修改要求描述：上次调用没有携带 prompt 参数，请根据用户需求补充 prompt 后重新调用本工具。"
+        preset_refs, preset_hint, hits = self._apply_presets(event, extra_text=prompt)
+        prompt = self._maybe_strip_features(prompt, hits)
+        prompt += preset_hint
 
         hint_text = f"{event.message_str} {prompt}"
-        refs = self._collect_refs(event, hint_text)
+        refs = self._collect_refs(event, hint_text, preset_refs)
         wait = self._wait_seconds()
         if not refs and wait <= 0:
             return NO_IMAGE_MSG
@@ -820,11 +1130,14 @@ class AutoImagePlugin(Star):
             yield event.plain_result("提示词不能为空，请描述要生成的画面。")
             return
 
-        params_text = " ".join(
-            filter(None, [model or "", ratio or "", size or ""])
-        )
+        # 注意：不能用内置 filter()——模块级 import 的 astrbot filter 会遮蔽它
+        params_text = " ".join(x for x in (model, ratio, size) if x)
         prompt += self._extract_face_hint(event)
-        refs = self._extract_image_sources(event) or self._collect_refs(event, body)
+        preset_refs, preset_hint, _hits = self._apply_presets(event)
+        prompt += preset_hint
+        refs = (preset_refs + self._extract_image_sources(event)) or self._collect_refs(
+            event, body, preset_refs
+        )
         result = await self._generate_and_send(event, prompt, params_text, refs)
         yield event.plain_result(result)
 
@@ -843,7 +1156,8 @@ class AutoImagePlugin(Star):
             )
             return
 
-        refs = self._collect_refs(event, body)
+        preset_refs, preset_hint, _hits = self._apply_presets(event)
+        refs = self._collect_refs(event, body, preset_refs)
         if not refs:
             yield event.plain_result(
                 "没有找到可供修改的图片，请先发送图片或回复引用一张图片。"
@@ -854,13 +1168,95 @@ class AutoImagePlugin(Star):
         ratio = match_ratio(opts.get("aspect_ratio", "")) or match_ratio(prompt)
         size = match_size(opts.get("image_size", "")) or match_size(prompt)
         prompt = strip_param_words(prompt) or body
-        prompt += self._extract_face_hint(event)
+        prompt += self._extract_face_hint(event) + preset_hint
 
-        params_text = " ".join(
-            filter(None, [model or "", ratio or "", size or ""])
-        )
+        params_text = " ".join(x for x in (model, ratio, size) if x)
         result = await self._generate_and_send(event, prompt, params_text, refs)
         yield event.plain_result(result)
+
+    # ---------------- 提示词图库指令（预设②，WebUI 页面之外的 QQ 侧管理入口） ----------------
+
+    @filter.command("图库", alias={"图库列表", "gallery"})
+    async def gallery_list(self, event: AstrMessageEvent):
+        """查看提示词图库：生图/改图要求命中预设提示词时自动带对应图片作参考图"""
+        items = self.gallery.list_items()
+        if not items:
+            yield event.plain_result(
+                "提示词图库为空。\n"
+                "添加方式：发送 /图库添加 <预设提示词> 并附带（或回复）一张图片；\n"
+                "或在 WebUI 插件详情页打开「提示词图库」页面可视化管理。"
+            )
+            return
+        lines = [
+            f"提示词图库（共 {len(items)} 张，生图/改图提到关键词自动带图）："
+        ]
+        comps: list = []
+        shown = 0
+        for i, it in enumerate(items, 1):
+            kw = "、".join(f"「{k}」" for k in it["keywords"]) or "（未设置提示词）"
+            t = (
+                time.strftime("%m-%d %H:%M", time.localtime(it["ts"]))
+                if it["ts"]
+                else ""
+            )
+            missing = "" if it.get("has_image") else " ⚠️图片缺失"
+            lines.append(f"{i}. {kw} {t}{missing}".rstrip())
+            if shown < 9 and it.get("has_image"):
+                comps.append(Plain(f"#{i} " + "、".join(it["keywords"])))
+                comps.append(Image.fromFileSystem(str(self.gallery.image_path(it))))
+                shown += 1
+        lines.append("管理：/图库添加 <预设提示词>（带图或回复图） · /图库删除 <序号> · 或 WebUI 插件页面")
+        await self._send(event, [Plain("\n".join(lines))] + comps)
+        return
+
+    @filter.command("图库添加", alias={"图库加", "gallery_add"})
+    async def gallery_add(self, event: AstrMessageEvent):
+        """把图片加入提示词图库：/图库添加 <预设提示词>，消息附带图片或回复一张图片"""
+        raw = event.message_str.strip()
+        body = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+        keywords = sanitize_keywords(re.split(r"[\s,，、]+", body))
+        sources = self._extract_image_sources(event)
+        if not keywords or not sources:
+            yield event.plain_result(
+                "用法：/图库添加 <预设提示词> 并附带一张图片（或回复一张图片）\n"
+                "多个提示词用空格 / 逗号分隔，如：/图库添加 猫娘 女仆装\n"
+                "之后生图 / 改图要求里提到这些词时，会自动带上这张图作为参考图。"
+            )
+            return
+        try:
+            data, ext = await self._gallery_fetch_bytes(sources[0])
+            item = self.gallery.create(keywords)
+            try:
+                self.gallery.attach_bytes(item["id"], data, ext)
+            except Exception:
+                self.gallery.remove(item["id"])
+                raise
+        except Exception as e:
+            yield event.plain_result(f"⚠️ 添加失败：{e}")
+            return
+        kw_text = "、".join(f"「{k}」" for k in item["keywords"])
+        yield event.plain_result(
+            f"✅ 已加入提示词图库（第 {len(self.gallery.list_items())} 张）：{kw_text}\n"
+            "之后生图 / 改图要求里提到这些词，就会自动带上这张图。"
+        )
+
+    @filter.command("图库删除", alias={"图库删", "gallery_del"})
+    async def gallery_del(self, event: AstrMessageEvent):
+        """删除图库图片：/图库删除 <序号>（序号见 /图库 列表）"""
+        raw = event.message_str.strip()
+        body = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+        m = re.search(r"\d+", body)
+        if not m:
+            yield event.plain_result("用法：/图库删除 <序号>，序号可通过 /图库 查看。")
+            return
+        idx = int(m.group())
+        item = self.gallery.nth(idx)
+        if item is None:
+            yield event.plain_result(f"序号 {idx} 不存在，发送 /图库 查看当前列表。")
+            return
+        self.gallery.remove(item["id"])
+        kw_text = "、".join(f"「{k}」" for k in item.get("keywords", []))
+        yield event.plain_result(f"🗑 已删除图库第 {idx} 张（{kw_text}）。")
 
     @filter.command("生图模型", alias={"models"})
     async def list_models(self, event: AstrMessageEvent):
