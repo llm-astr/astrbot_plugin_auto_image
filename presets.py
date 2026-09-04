@@ -28,6 +28,8 @@ class PresetHit:
     提示附加到提示词末尾，帮助生图模型理解每张参考图的含义。
     record 为 False 时，命中补充的参考图不会写入会话最近图片缓存
     （图库类预设图片长期有效，无需再进缓存，避免污染「我发的图」语义取图）。
+    names 为命中预设涉及的预设提示词原文列表（如「lll」），main.py 会在
+    工具结果中提醒 LLM 回复用户时沿用原文写法，避免「lll」被写成「LLM」。
     """
 
     def __init__(
@@ -37,12 +39,14 @@ class PresetHit:
         prompt_hint: str = "",
         labels: list | None = None,
         record: bool = True,
+        names: list | None = None,
     ):
         self.preset_id = preset_id
         self.refs = list(refs or [])
         self.labels = list(labels or [])
         self.prompt_hint = prompt_hint
         self.record = record
+        self.names = list(names or [])
 
 
 class Preset:
@@ -137,7 +141,8 @@ _FEATURE_TERMS_CJK = [
     # 面部 / 皮肤
     "脸颊", "红晕", "脸红", "肤色", "皮肤", "面容", "五官", "鼻梁", "鼻子", "嘴唇",
     "睫毛", "眉毛", "雀斑", "酒窝", "虎牙", "泪痣",
-    # 服饰
+    # 服饰（先放泛指词，再列具体服饰；泛指词兜底「蓝色系现代感服装」这类写法）
+    "服装", "衣服", "服饰", "装扮", "穿搭", "着装", "打扮",
     "连衣裙", "女仆装", "女仆风", "短裙", "长裙", "百褶裙", "制服", "校服", "水手服",
     "和服", "浴衣", "泳装", "比基尼", "婚纱", "西装", "礼服", "卫衣", "夹克", "旗袍",
     "洛丽塔", "发饰", "发夹", "蝴蝶结", "丝带", "丝袜", "长袜", "过膝袜", "短袜",
@@ -145,6 +150,8 @@ _FEATURE_TERMS_CJK = [
     "耳坠", "围裙", "吊带裙", "衬衫", "外套", "风衣", "披风", "斗篷", "腰带", "发带",
     # 体型
     "身材", "体型", "身高", "娇小", "高挑", "丰满", "纤瘦", "苗条", "长腿", "锁骨",
+    # 整体外观 / 造型泛指
+    "造型", "配色", "外观", "外形", "外表", "长相", "模样", "形象", "妆容", "人设",
 ]
 
 # 人物外观特征词（英文 tag，词边界匹配避免误伤，如 chair 不含 hair）
@@ -161,7 +168,8 @@ _FEATURE_TERMS_EN = re.compile(
     r"dress|maid(\s+outfit)?|skirt|miniskirt|pleated\s+skirt|uniform|kimono|yukata|"
     r"swimsuit|bikini|wedding\s+dress|suit|hoodie|jacket|lolita|ribbon|stockings|"
     r"thighhighs|socks|boots|gloves|scarf|glasses|hat|necklace|earrings|apron|"
-    r"shirt|coat|cape|cloak|belt"
+    r"shirt|coat|cape|cloak|belt|outfits?|clothing|clothes|costume|apparel|wardrobe|"
+    r"appearance"
     r")\b",
     re.IGNORECASE,
 )
@@ -247,13 +255,16 @@ class GalleryPreset(Preset):
             return None
         refs: list = []
         labels: list[str] = []
+        names: list[str] = []
         for it in items:
             kw = it["matched_keyword"]
             refs.append(("", str(self.gallery.image_path(it))))
             labels.append(
                 f"预设提示词「{kw}」对应的参考图，「{kw}」的人物形象与外观特征直接以此图为准"
             )
-        return PresetHit(self.id, refs=refs, labels=labels, record=False)
+            if kw not in names:
+                names.append(kw)
+        return PresetHit(self.id, refs=refs, labels=labels, record=False, names=names)
 
 
 # ---------------- 注册表 ----------------
